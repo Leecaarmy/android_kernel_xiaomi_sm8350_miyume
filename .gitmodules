@@ -1,4 +1,4 @@
 [submodule "KernelSU"]
 	path = KernelSU
-	url = https://github.com/ReSukiSU/ReSukiSU.git
-	branch = main
+	url = https://github.com/Leecaarmy/android_kernel_xiaomi_sm8350_miyume.git
+	branch = dynamic/bakasu-linux54
