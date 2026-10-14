@@ -2,6 +2,7 @@
 #define __KSU_H_SUCOMPAT
 #include <asm/ptrace.h>
 #include <linux/types.h>
+#include <linux/version.h>
 #include "compat/kernel_compat.h"
 
 #ifdef KSU_COMPAT_USE_STATIC_KEY
@@ -14,7 +15,8 @@ void ksu_sucompat_init(void);
 void ksu_sucompat_exit(void);
 
 // Handler functions exported for hook_manager
-#ifdef CONFIG_KSU_SUSFS
+// This tree's 5.4 hooks pass user pathnames, not struct filename objects.
+#if defined(CONFIG_KSU_SUSFS) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)
 int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);
 int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
 #else

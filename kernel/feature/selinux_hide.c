@@ -1168,10 +1168,10 @@ static int string_to_context_struct(struct policydb *pol, struct policydb *orig_
     orig_rc = rc = -EINVAL;
 
     if (policydb_context_isvalid(pol, ctx)) {
-        rc = 0;
+        rc = context_add_hash(pol, ctx);
     }
     if (policydb_context_isvalid(orig_pol, orig_ctx)) {
-        orig_rc = 0;
+        orig_rc = context_add_hash(orig_pol, orig_ctx);
     }
 out:
     if (rc)

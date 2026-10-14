@@ -17,4 +17,3 @@ endif
 
 $(info -- $(REPO_NAME): susfs has NOT update with latest KernelSU source)
 $(info -- $(REPO_NAME): Please wait simonpunk update)
-$(error Please wait susfs update.)
