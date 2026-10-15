@@ -2,6 +2,7 @@
 #define MILLET_H
 
 #include <linux/freezer.h>
+#include <linux/cgroup.h>
 #include <net/sock.h>
 #include <linux/proc_fs.h>
 #include <linux/sched.h>
@@ -64,6 +65,7 @@ static inline int unregister_millet_hook(int type) { return 0; }
 #endif
 static inline int frozen_task_group(struct task_struct *task)
 {
-	return (freezing(task) || frozen(task));
+	return freezing(task) || frozen(task) ||
+		cgroup_task_freeze(task) || cgroup_task_frozen(task);
 }
 #endif

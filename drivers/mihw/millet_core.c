@@ -99,12 +99,11 @@ int millet_sendto_user(struct task_struct *tsk,
 	struct millet_data *payload = NULL;
 	struct timespec64 ts;
 
-	if (!atomic_read(&sk->has_init))
+	if (!sk || !atomic_read(&sk->has_init))
 		return RET_ERR;
 
-	if (!data || !MSG_VALID(data->msg_type)) {
-		pr_err("%s:msg or  msg type is invalid! %d\n",
-		       __func__, data->msg_type);
+	if (!data || !MSG_VALID(data->msg_type) || !TYPE_VALID(data->owner)) {
+		pr_err("%s: invalid message or owner\n", __func__);
 		return RET_ERR;
 	}
 
@@ -136,6 +135,10 @@ int millet_sendto_user(struct task_struct *tsk,
 	payload->tm.sec  = ts.tv_sec;
 	payload->tm.nsec = ts.tv_nsec;
 	monitor_port = atomic_read(&sk->mod[monitor].port);
+	if (!monitor_port) {
+		kfree_skb(skb);
+		return RET_ERR;
+	}
 	dump_send_msg(payload);
 
 	ret = nlmsg_unicast(sk->sock, skb, monitor_port);
@@ -149,7 +152,8 @@ int millet_sendto_user(struct task_struct *tsk,
 					monitor_port);
 	}
 
-	return RET_OK;
+	/* Zero is reserved for callbacks which did not send a message. */
+	return 1;
 }
 
 int millet_sendmsg(enum MILLET_TYPE type, struct task_struct *tsk,
@@ -213,13 +217,14 @@ static void recv_handler(struct sk_buff *skb)
 	}
 
 	nlh = nlmsg_hdr(skb);
-	if (nlh->nlmsg_len < NLMSG_SPACE(msglen)) {
+	if (!nlmsg_ok(nlh, skb->len) ||
+	    nlmsg_len(nlh) < msglen) {
 		pr_err("msg len err %d need %d\n",
 		       nlh->nlmsg_len, NLMSG_SPACE(msglen));
 		return;
 	}
 
-	from = nlh->nlmsg_pid;
+	from = NETLINK_CB(skb).portid;
 	payload = (struct millet_userconf *) NLMSG_DATA(nlh);
 	if (payload->src_port != MILLET_USER_ID) {
 		pr_err("src_port %x invalid! from %d need len %d len %d\n",
@@ -247,7 +252,7 @@ static void recv_handler(struct sk_buff *skb)
 
 	switch (payload->msg_type) {
 	case LOOPBACK_MSG: {
-		struct millet_data data;
+		struct millet_data data = { 0 };
 		data.msg_type = LOOPBACK_MSG;
 		data.owner = payload->owner;
 		atomic_set(&millet_sk.mod[payload->owner].port, from);
@@ -340,16 +345,18 @@ static void stat_reset(void)
 static ssize_t millet_stat_write(struct file *filp,
 		const char __user *buf, size_t count, loff_t *f_ops)
 {
-	unsigned char tmp = 0;
-	int value = 0;
+	int value, ret;
 
-	get_user(tmp, buf);
-	value = simple_strtol(&tmp, NULL, 10);
-	pr_info("input value number: %d\n", value);
-	if (value == 1)
+	if (!count)
+		return 0;
+	ret = kstrtoint_from_user(buf, count, 10, &value);
+	if (ret)
+		return ret;
+	if (value == 1) {
 		stat_reset();
+		pr_info("stat reset now\n");
+	}
 
-	printk(KERN_WARNING "stat reset now\n");
 	return count;
 }
 

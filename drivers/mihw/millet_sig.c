@@ -4,10 +4,9 @@
 #include <linux/signal.h>
 #include "millet.h"
 
-static int last_report_task;
 void millet_sig(int sig, struct task_struct *killer, struct task_struct *dst)
 {
-	struct millet_data data;
+	struct millet_data data = { 0 };
 
 	if (sig == SIGKILL
 			|| sig == SIGTERM
@@ -36,21 +35,17 @@ static int signals_sendmsg(struct task_struct *tsk,
 	data->msg_type = MSG_TO_USER;
 	data->owner = SIG_TYPE;
 
-	if (frozen_task_group(tsk)
-		&& (data->mod.k_priv.sig.killed_pid != *(int *)sk->mod[SIG_TYPE].priv)) {
-		*(int *)sk->mod[SIG_TYPE].priv = data->mod.k_priv.sig.killed_pid;
+	/* A cached PID would suppress retries and later freeze cycles. */
+	if (frozen_task_group(tsk))
 		ret = millet_sendto_user(tsk, data, sk);
-	}
 
 	return ret;
 }
 
 static void signas_init_millet(struct millet_sock *sk)
 {
-	if (sk) {
+	if (sk)
 		sk->mod[SIG_TYPE].monitor = SIG_TYPE;
-		sk->mod[SIG_TYPE].priv = (void *)&last_report_task;
-	}
 }
 
 static int __init sig_mod_init(void)

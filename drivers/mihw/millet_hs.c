@@ -22,7 +22,7 @@ static int hs_sendmsg(struct task_struct *tsk,
 
 static void hs_recv_hook(void *nouse, unsigned int len)
 {
-	struct millet_data data;
+	struct millet_data data = { 0 };
 
 	millet_sendmsg(HANDSHK_TYPE, current, &data);
 }

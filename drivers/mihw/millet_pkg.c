@@ -20,15 +20,26 @@
 
 
 #define MAX_REC_UID 64
-static atomic_t uid_rec[MAX_REC_UID];
+static struct pkg_uid_entry {
+	uid_t uid;
+	u64 generation;
+	bool pending;
+} uid_rec[MAX_REC_UID];
+static DEFINE_SPINLOCK(uid_rec_lock);
 
 int pkg_stat_show(struct seq_file *m, void *v)
 {
 	int i;
+	unsigned long flags;
+	uid_t uids[MAX_REC_UID];
 
+	spin_lock_irqsave(&uid_rec_lock, flags);
 	for (i = 0; i < MAX_REC_UID; i++)
-		if (atomic_read(&uid_rec[i]))
-			seq_printf(m, "%d\t", atomic_read(&uid_rec[i]));
+		uids[i] = uid_rec[i].uid;
+	spin_unlock_irqrestore(&uid_rec_lock, flags);
+	for (i = 0; i < MAX_REC_UID; i++)
+		if (uids[i])
+			seq_printf(m, "%d\t", uids[i]);
 	seq_printf(m, "\n");
 
 	return 0;
@@ -37,23 +48,35 @@ int pkg_stat_show(struct seq_file *m, void *v)
 static void pkg_add_uid(uid_t uid)
 {
 	int i, j;
-	uid_t inner_uid;
+	unsigned long flags;
 
+	if (!uid)
+		return;
+
+	spin_lock_irqsave(&uid_rec_lock, flags);
 	for (i = 0, j = MAX_REC_UID; i < MAX_REC_UID; i++) {
-		inner_uid = atomic_read(&uid_rec[i]);
-		if (inner_uid == 0 && j == MAX_REC_UID)
+		if (!uid_rec[i].uid && j == MAX_REC_UID)
 			j = i;
-		else if (inner_uid == uid)
+		else if (uid_rec[i].uid == uid) {
+			/* Re-arm an entry whose previous notification is in flight. */
+			if (uid_rec[i].pending) {
+				uid_rec[i].generation++;
+				uid_rec[i].pending = false;
+			}
 			goto out;
+		}
 	}
 
-	if (j < MAX_REC_UID)
-		atomic_set(&uid_rec[j], uid);
-	else
+	if (j < MAX_REC_UID) {
+		uid_rec[j].generation++;
+		uid_rec[j].uid = uid;
+		uid_rec[j].pending = false;
+	} else {
 		pr_err("%s : add uid:%d failed (full)!\n", __func__, uid);
+	}
 
 out:
-	return;
+	spin_unlock_irqrestore(&uid_rec_lock, flags);
 }
 
 static int pkg_sendmsg(struct task_struct *tsk,
@@ -77,45 +100,69 @@ static int pkg_sendmsg(struct task_struct *tsk,
 static void pkg_del_uid(uid_t uid)
 {
 	int i;
-	uid_t inner_uid;
+	unsigned long flags;
 
+	spin_lock_irqsave(&uid_rec_lock, flags);
 	for (i = 0; i < MAX_REC_UID; i++) {
-		inner_uid = (uid_t) atomic_read(&uid_rec[i]);
-		if (inner_uid == uid) {
-			atomic_set(&uid_rec[i], 0);
+		if (uid_rec[i].uid == uid) {
+			uid_rec[i].generation++;
+			uid_rec[i].uid = 0;
+			uid_rec[i].pending = false;
 			break;
 		}
 	}
-
-	return;
+	spin_unlock_irqrestore(&uid_rec_lock, flags);
 }
 
 static void pkg_clear_all(void)
 {
 	int i;
+	unsigned long flags;
 
-	for (i = 0; i < MAX_REC_UID; i++)
-		atomic_set(&uid_rec[i], 0);
-
-	return;
+	spin_lock_irqsave(&uid_rec_lock, flags);
+	for (i = 0; i < MAX_REC_UID; i++) {
+		uid_rec[i].generation++;
+		uid_rec[i].uid = 0;
+		uid_rec[i].pending = false;
+	}
+	spin_unlock_irqrestore(&uid_rec_lock, flags);
 }
 
-static int find_and_clear_uid(uid_t uid)
+static int pkg_claim_uid(uid_t uid, u64 *generation)
 {
-	int found = 0;
-	int i = 0;
-	uid_t inner_uid;
+	int i, slot = -1;
+	unsigned long flags;
 
+	spin_lock_irqsave(&uid_rec_lock, flags);
 	for (i = 0; i < MAX_REC_UID; i++) {
-		inner_uid = atomic_read(&uid_rec[i]);
-		if (unlikely(inner_uid == uid)) {
-			if (atomic_cmpxchg(&uid_rec[i], uid, 0) == uid)
-				found = 1;
+		if (uid_rec[i].uid == uid) {
+			if (!uid_rec[i].pending) {
+				uid_rec[i].pending = true;
+				*generation = uid_rec[i].generation;
+				slot = i;
+			}
 			break;
 		}
 	}
+	spin_unlock_irqrestore(&uid_rec_lock, flags);
 
-	return found;
+	return slot;
+}
+
+static void pkg_complete_uid(int slot, uid_t uid, u64 generation, int ret)
+{
+	unsigned long flags;
+	struct pkg_uid_entry *entry = &uid_rec[slot];
+
+	spin_lock_irqsave(&uid_rec_lock, flags);
+	/* ADD/DEL/CLEAR may have replaced the registration while sending. */
+	if (entry->uid == uid && entry->generation == generation &&
+	    entry->pending) {
+		entry->pending = false;
+		if (ret > 0)
+			entry->uid = 0;
+	}
+	spin_unlock_irqrestore(&uid_rec_lock, flags);
 }
 
 static void pkg_recv_hook(void *data, unsigned int len)
@@ -161,9 +208,10 @@ static unsigned int pkg_ip4_in(void *priv, struct sk_buff *skb,
 		const struct nf_hook_state *state)
 {
 	struct sock *sk;
-	struct millet_data data;
+	struct millet_data data = { 0 };
 	uid_t uid;
-	int found;
+	u64 generation;
+	int slot, ret;
 	int protocol;
 
 	protocol = ip_hdr(skb)->protocol;
@@ -178,12 +226,14 @@ static unsigned int pkg_ip4_in(void *priv, struct sk_buff *skb,
 	if (uid < UID_MIN_VALUE)
 		return NF_ACCEPT;
 
-	found = find_and_clear_uid(uid);
-	if (!found)
+	slot = pkg_claim_uid(uid, &generation);
+	if (slot < 0)
 		return NF_ACCEPT;
 	data.mod.k_priv.pkg.owner_pid = 0;
 	data.mod.k_priv.pkg.pkg_owner = (int) uid;
-	if (millet_sendmsg(PKG_TYPE, current, &data) < 0)
+	ret = millet_sendmsg(PKG_TYPE, current, &data);
+	pkg_complete_uid(slot, uid, generation, ret);
+	if (ret < 0)
 		pr_err("%s : up report failed!\n", __func__);
 
 	return NF_ACCEPT;
@@ -193,12 +243,13 @@ static unsigned int pkg_ip6_in(void *priv, struct sk_buff *skb,
 		const struct nf_hook_state *state)
 {
 	struct sock *sk;
-	struct millet_data data;
+	struct millet_data data = { 0 };
 	unsigned int thoff = 0;
 	unsigned short frag_off = 0;
 	int protohdr;
 	uid_t uid;
-	int found;
+	u64 generation;
+	int slot, ret;
 
 	protohdr = ipv6_find_hdr(skb, &thoff, -1, &frag_off, NULL);
 	if (protohdr != IPPROTO_TCP)
@@ -212,13 +263,15 @@ static unsigned int pkg_ip6_in(void *priv, struct sk_buff *skb,
 	if (uid < UID_MIN_VALUE)
 		return NF_ACCEPT;
 
-	found = find_and_clear_uid(uid);
-	if (!found)
+	slot = pkg_claim_uid(uid, &generation);
+	if (slot < 0)
 		return NF_ACCEPT;
 
 	data.mod.k_priv.pkg.owner_pid = 0;
 	data.mod.k_priv.pkg.pkg_owner = (int) uid;
-	if (millet_sendmsg(PKG_TYPE, current, &data) < 0)
+	ret = millet_sendmsg(PKG_TYPE, current, &data);
+	pkg_complete_uid(slot, uid, generation, ret);
+	if (ret < 0)
 		pr_err("%s : up report failed!\n", __func__);
 
 	return NF_ACCEPT;
@@ -269,11 +322,9 @@ static struct nf_hook_ops pkg_nf_ops[] = {
 static int __init millet_pkg_init(void)
 {
 	int ret;
-	int i;
 	struct net *net = &init_net;
 
-	for (i = 0; i < MAX_REC_UID; i++)
-		atomic_set(&uid_rec[i], 0);
+	pkg_clear_all();
 
 	ret = nf_register_net_hooks(net, pkg_nf_ops, ARRAY_SIZE(pkg_nf_ops));
 	if (ret < 0) {
